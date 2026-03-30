@@ -238,6 +238,8 @@ def run():
     if slug in [p["slug"] for p in log.get("published", [])]:
         log["slot_index"] = idx + 1
         save_log(log)
+        if git_push
+        save_log(log)
         return
     print(f"\n[{now}] Generating: {title}")
     print(f"  Keyword: {keyword}")
@@ -257,6 +259,8 @@ def run():
             "url": f"{BASE_URL}/{slug}", "published_at": now.isoformat()
         })
         log["slot_index"] = idx + 1
+        save_log(log)
+        if git_push
         save_log(log)
         print(f"  LIVE: {BASE_URL}/{slug}")
     else:

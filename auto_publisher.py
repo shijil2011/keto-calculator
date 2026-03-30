@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Keto Calculator Auto-Publisher v4
-- Generates articles on-demand using Ollama AI
+Keto Calculator Auto-Publisher v5 (Final)
+- Generates articles on-demand using Ollama AI (minimax-m2.7:cloud)
 - Dynamic internal links from previously published pages
 - Auto-updates sitemap after every publication
 - SEO meta title (<60 chars) and meta description (<160 chars)
+- Retry logic for Git push
 - Runs via crontab: 8 AM and 5 PM daily
 """
 
-import os, json, requests, subprocess
+import os, json, requests, subprocess, time
 from datetime import datetime
 
 SITE_DIR = "/root/.openclaw/workspace/keto-calculator"
@@ -87,21 +88,28 @@ def load_log():
             return json.load(f)
     return {"published": [], "slot_index": 0}
 
+
 def save_log(log):
     with open(LOG_FILE, 'w') as f:
         json.dump(log, f, indent=2)
 
+
 def get_published_links():
     log = load_log()
-    return [{"slug": p["slug"], "url": f"{BASE_URL}/{p['slug']}", "title": p["title"]} for p in log.get("published", [])]
+    return [
+        {"slug": p["slug"], "url": f"{BASE_URL}/{p['slug']}", "title": p["title"]}
+        for p in log.get("published", [])
+    ]
+
 
 def load_template():
     with open(TEMPLATE_FILE) as f:
         return f.read()
 
+
 def generate_article_ai(slug, title, keyword, category):
-    # Step 1: Generate SEO meta title & description
-    meta_prompt = f'Generate SEO meta title (max 60 chars) and meta description (max 160 chars) for: "{keyword}". Format exactly as: TITLE: [title]|DESC: [desc]'
+    # Generate SEO meta title & description
+    meta_prompt = f'Generate SEO meta title (max 60 chars) and meta description (max 160 chars) for keyword: "{keyword}". Format: TITLE: [title]|DESC: [desc]'
     meta_title, meta_desc = title[:60], f"Expert guide to {keyword}. Meal plans, tips, and science-backed advice for ketogenic diet success."
     try:
         r = requests.post(OLLAMA_URL, json={
@@ -113,18 +121,18 @@ def generate_article_ai(slug, title, keyword, category):
         if r.status_code == 200:
             raw = r.json().get("response", "")
             for line in raw.split("\n"):
-                if line.startswith("TITLE:") or "TITLE:" in line:
-                    t = line.split("TITLE:")[-1].strip()
+                if "TITLE:" in line:
+                    t = line.split("TITLE:")[-1].strip().rstrip("|").rstrip("/")
                     if 10 < len(t) <= 60:
                         meta_title = t
-                if line.startswith("DESC:") or "DESC:" in line:
-                    d = line.split("DESC:")[-1].strip()
+                if "DESC:" in line:
+                    d = line.split("DESC:")[-1].strip().rstrip("|").rstrip("/")
                     if 50 < len(d) <= 160:
                         meta_desc = d
     except Exception as e:
-        print(f"Meta gen error: {e}")
+        print(f"  Meta gen error: {e}")
 
-    # Step 2: Generate article content
+    # Generate article content
     content_prompt = f'''Write a 2000+ word SEO article for keyword: "{keyword}". Title: "{title}".
 
 Requirements:
@@ -133,7 +141,6 @@ Requirements:
 3. Include 5+ FAQ entries at the end
 4. Expert authoritative tone
 5. Minimum 2000 words
-6. Include internal links to related topics naturally
 
 Start directly with content.'''
     content = None
@@ -147,20 +154,17 @@ Start directly with content.'''
         if r.status_code == 200:
             content = r.json().get("response", "")
     except Exception as e:
-        print(f"Content gen error: {e}")
+        print(f"  Content gen error: {e}")
 
     return meta_title[:60], meta_desc[:160], content
+
 
 def create_page(slug, title, keyword, category, content, meta_title, meta_desc, internal_links):
     page_path = f"{SITE_DIR}/app/{slug}/page.tsx"
     os.makedirs(f"{SITE_DIR}/app/{slug}", exist_ok=True)
-
     tmpl = load_template()
 
-    # Build function name
     fn_name = slug.replace("-", "").title().replace("", "")
-
-    # Meta keywords
     meta_kw = f"{keyword}, ketogenic diet, keto guide, low carb"
 
     # Internal links section
@@ -175,11 +179,9 @@ def create_page(slug, title, keyword, category, content, meta_title, meta_desc, 
     else:
         links_html = ""
 
-    # Page content - escape for JSX
     safe_content = (content or "Content coming soon.")[:3000]
     safe_content = safe_content.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
 
-    # Replace placeholders in template
     page_code = tmpl
     page_code = page_code.replace("PAGE_IMPORTS",
         'import Link from "next/link"\n'
@@ -205,6 +207,7 @@ def create_page(slug, title, keyword, category, content, meta_title, meta_desc, 
         f.write(page_code)
     return page_path
 
+
 def update_sitemap():
     log = load_log()
     lines = [
@@ -219,52 +222,78 @@ def update_sitemap():
     with open(f"{SITE_DIR}/app/sitemap.ts", 'w') as f:
         f.write('\n'.join(lines))
 
-def git_push(msg):
-    subprocess.run(["git", "add", "."], cwd=SITE_DIR, capture_output=True)
-    r = subprocess.run(["git", "commit", "-m", msg], cwd=SITE_DIR, capture_output=True)
-    if r.returncode != 0:
-        return False
-    pr = subprocess.run(["git", "push", "origin", "main"], cwd=SITE_DIR, capture_output=True)
-    return pr.returncode == 0
+
+def git_push(msg, retries=3):
+    """Commit and push with retry logic."""
+    for attempt in range(retries):
+        subprocess.run(["git", "add", "."], cwd=SITE_DIR, capture_output=True)
+        r = subprocess.run(["git", "commit", "-m", msg], cwd=SITE_DIR, capture_output=True)
+        if r.returncode != 0:
+            check = subprocess.run(["git", "status", "--porcelain"], cwd=SITE_DIR, capture_output=True, text=True)
+            if not check.stdout.strip():
+                print(f"  (Nothing to commit on attempt {attempt+1})")
+                return True
+            print(f"  Commit failed (attempt {attempt+1}), retrying...")
+            time.sleep(2)
+            continue
+        pr = subprocess.run(["git", "push", "origin", "main"], cwd=SITE_DIR, capture_output=True)
+        if pr.returncode == 0:
+            return True
+        print(f"  Push failed (attempt {attempt+1}), retrying...")
+        time.sleep(3)
+    return False
+
 
 def run():
     log = load_log()
     now = datetime.now()
     idx = log.get("slot_index", 0)
+
     if idx >= len(CONTENT_PLAN):
         print(f"[{now}] All 60 articles published!")
         return
+
     slug, title, keyword, category = CONTENT_PLAN[idx]
+
     if slug in [p["slug"] for p in log.get("published", [])]:
+        print(f"[{now}] Already published: {slug}, skipping.")
         log["slot_index"] = idx + 1
         save_log(log)
-        if git_push
-        save_log(log)
         return
-    print(f"\n[{now}] Generating: {title}")
+
+    print(f"\n[{now}] Publishing article {idx+1}/60: {title}")
     print(f"  Keyword: {keyword}")
     print(f"  Category: {category}")
+
     mt, md, content = generate_article_ai(slug, title, keyword, category)
+
     if not content:
-        print("  FAILED: No content from AI")
+        print("  ERROR: No content generated from AI")
         return
-    print(f"  Content: {len(content)} chars | Meta: {mt[:50]}")
+
+    print(f"  Content: {len(content)} chars")
+    print(f"  Meta Title ({len(mt)} chars): {mt}")
+    print(f"  Meta Desc ({len(md)} chars): {md[:60]}...")
+
     il = get_published_links()
+    print(f"  Internal links: {len(il)}")
+
     create_page(slug, title, keyword, category, content, mt, md, il)
     update_sitemap()
+
     if git_push(f"Published: {title} | {keyword}"):
-        log["published"].append({
+        entry = {
             "slug": slug, "title": title, "keyword": keyword,
             "category": category, "meta_title": mt, "meta_desc": md,
             "url": f"{BASE_URL}/{slug}", "published_at": now.isoformat()
-        })
+        }
+        log["published"].append(entry)
         log["slot_index"] = idx + 1
         save_log(log)
-        if git_push
-        save_log(log)
-        print(f"  LIVE: {BASE_URL}/{slug}")
+        print(f"  SUCCESS! URL: {BASE_URL}/{slug}")
     else:
-        print("  FAILED: Git push error")
+        print("  WARNING: Push failed after retries. Will retry next run.")
+
 
 if __name__ == "__main__":
     run()
